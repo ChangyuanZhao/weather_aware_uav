@@ -772,8 +772,8 @@ def main():
         model_update_freq=4,  # Update world model every 4 steps
         use_model_ratio=1.0  # 80% model data, 20% real data
     )
-    test_only = True
-    checkpoint_path = '/home/changyuan/dreamer/weather_aware/world_model_models_dqn/episode_1000'
+    test_only = False
+    checkpoint_path = ''
     if test_only:
         # Load trained model
         print(f"Loading checkpoint from: {checkpoint_path}")
