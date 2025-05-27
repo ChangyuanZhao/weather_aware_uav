@@ -135,7 +135,8 @@ class WorldModelDQNAgent:
             target_update_freq=10,
             model_lr=1e-3,
             model_update_freq=4,
-            use_model_ratio=0.5  # 50% of training uses model-generated data
+            use_model_ratio=0.5,  # 50% of training uses model-generated data
+            rollout_steps=1
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -148,6 +149,8 @@ class WorldModelDQNAgent:
         self.model_update_freq = model_update_freq
         self.use_model_ratio = use_model_ratio
         self.steps_done = 0
+
+        self.rollout_steps = rollout_steps
 
         # Initialize Q-networks (same as DQN)
         self.q_network = DQN(state_dim, action_dim).to(device)
@@ -198,8 +201,51 @@ class WorldModelDQNAgent:
 
         return total_model_loss.item()
 
+    # def generate_model_data(self, num_samples):
+    #     """Generate synthetic experiences using the world model"""
+    #     if len(self.replay_buffer) < num_samples:
+    #         return [], [], [], [], []
+    #
+    #     # Sample random states from replay buffer
+    #     experiences = random.sample(self.replay_buffer.buffer, k=num_samples)
+    #     states = [e.state for e in experiences]
+    #
+    #     model_states = []
+    #     model_actions = []
+    #     model_rewards = []
+    #     model_next_states = []
+    #     model_dones = []
+    #
+    #     with torch.no_grad():
+    #         for state in states:
+    #             # Random action for exploration in model
+    #             # action = random.randrange(self.action_dim)
+    #
+    #             # 不要完全随机，用epsilon-greedy
+    #             if random.random() < 0.3:  # 30%随机探索
+    #                 action = random.randrange(self.action_dim)
+    #             else:  # 70%根据当前策略选择
+    #                 with torch.no_grad():
+    #                     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    #                     q_values = self.q_network(state_tensor)
+    #                     action = q_values.argmax(dim=1).item()
+    #
+    #             # Use world model to predict next state and reward
+    #             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+    #             action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
+    #
+    #             next_state_pred, reward_pred = self.transition_model(state_tensor, action_tensor)
+    #
+    #             model_states.append(state)
+    #             model_actions.append(action)
+    #             model_rewards.append(reward_pred.item())
+    #             model_next_states.append(next_state_pred.squeeze().cpu().numpy())
+    #             model_dones.append(False)  # Assume no termination for simplicity
+    #
+    #     return model_states, model_actions, model_rewards, model_next_states, model_dones
+
     def generate_model_data(self, num_samples):
-        """Generate synthetic experiences using the world model"""
+        """Generate synthetic experiences using the world model with multi-step rollout"""
         if len(self.replay_buffer) < num_samples:
             return [], [], [], [], []
 
@@ -214,30 +260,33 @@ class WorldModelDQNAgent:
         model_dones = []
 
         with torch.no_grad():
-            for state in states:
-                # Random action for exploration in model
-                # action = random.randrange(self.action_dim)
+            for initial_state in states:
+                current_state = initial_state
 
-                # 不要完全随机，用epsilon-greedy
-                if random.random() < 0.3:  # 30%随机探索
-                    action = random.randrange(self.action_dim)
-                else:  # 70%根据当前策略选择
-                    with torch.no_grad():
-                        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                # 进行多步展开
+                for step in range(self.rollout_steps):
+                    # 选择动作 (epsilon-greedy)
+                    if random.random() < 0.8:
+                        action = random.randrange(self.action_dim)
+                    else:  # 70%根据当前策略选择
+                        state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(device)
                         q_values = self.q_network(state_tensor)
                         action = q_values.argmax(dim=1).item()
 
-                # Use world model to predict next state and reward
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-                action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
+                    # 使用world model预测下一状态和奖励
+                    state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(device)
+                    action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
+                    next_state_pred, reward_pred = self.transition_model(state_tensor, action_tensor)
 
-                next_state_pred, reward_pred = self.transition_model(state_tensor, action_tensor)
+                    # 存储这一步的转换
+                    model_states.append(current_state.copy())
+                    model_actions.append(action)
+                    model_rewards.append(reward_pred.item())
+                    model_next_states.append(next_state_pred.squeeze().cpu().numpy())
+                    model_dones.append(False)  # 假设不终止
 
-                model_states.append(state)
-                model_actions.append(action)
-                model_rewards.append(reward_pred.item())
-                model_next_states.append(next_state_pred.squeeze().cpu().numpy())
-                model_dones.append(False)  # Assume no termination for simplicity
+                    # 更新当前状态为预测的下一状态，用于下一步预测
+                    current_state = next_state_pred.squeeze().cpu().numpy()
 
         return model_states, model_actions, model_rewards, model_next_states, model_dones
 
@@ -770,7 +819,8 @@ def main():
         target_update_freq=10,
         model_lr=1e-3,  # Learning rate for world model
         model_update_freq=4,  # Update world model every 4 steps
-        use_model_ratio=1.0  # 80% model data, 20% real data
+        use_model_ratio=1.0,  # 80% model data, 20% real data
+        rollout_steps = 1
     )
     test_only = False
     checkpoint_path = ''
