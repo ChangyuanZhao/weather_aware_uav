@@ -2,26 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple World Model DQN implementation for UAV OFDMA data rate optimization.
-Features a lightweight transition model that only predicts one-step ahead,
-avoiding the complexity and instability of multi-step planning.
+Enhanced World Model DQN with Trajectory Planning for UAV OFDMA Optimization.
+Main training script without visualization (plots removed).
 
-Added feature: Stop collecting new data after specified episode while continuing training.
+Key improvements:
+1. Longer rollout (5-10 steps) for better trajectory planning
+2. Model-based action selection using planning
+3. Trajectory-level value estimation
+4. Better exploitation of learned world model
 """
 
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from collections import deque, namedtuple
 import random
 import copy
 import types
 import time
-from tqdm import tqdm
 
 from uav_weather_env import WeatherAwareUAVEnv
 
@@ -34,7 +38,7 @@ random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Experience replay buffer (same as DQN)
+# Experience replay buffer
 Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
 
 
@@ -61,27 +65,39 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# Simple Transition Model - only predicts one step ahead
+# Enhanced Transition Model with MLP encoder for state only
 class TransitionModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, encoder_dim=16):
         super(TransitionModel, self).__init__()
 
-        # Input: state + action (one-hot encoded)
-        input_dim = state_dim + action_dim
-
-        # Simple MLP for next state prediction
-        self.state_predictor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        # MLP encoder for state
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, encoder_dim),
             nn.ReLU(),
+            nn.LayerNorm(encoder_dim),
+            nn.Linear(encoder_dim, encoder_dim),
+            nn.ReLU()
+        )
+
+        # Combined features: encoded state + one-hot action
+        combined_dim = encoder_dim + action_dim
+
+        # Enhanced MLP for next state prediction
+        self.state_predictor = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, state_dim)
         )
 
-        # Simple MLP for reward prediction
+        # Enhanced MLP for reward prediction
         self.reward_predictor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(combined_dim, hidden_dim),
             nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
@@ -93,19 +109,22 @@ class TransitionModel(nn.Module):
         action_one_hot = torch.zeros(batch_size, 9).to(device)  # 9 actions
         action_one_hot.scatter_(1, action, 1)
 
-        # Concatenate state and action
-        input_tensor = torch.cat([state, action_one_hot], dim=1)
+        # Encode state only
+        state_encoded = self.state_encoder(state)
+
+        # Concatenate encoded state with one-hot action
+        combined_features = torch.cat([state_encoded, action_one_hot], dim=1)
 
         # Predict next state and reward
-        next_state_pred = self.state_predictor(input_tensor)
-        reward_pred = self.reward_predictor(input_tensor)
+        next_state_pred = self.state_predictor(combined_features)
+        reward_pred = self.reward_predictor(combined_features)
 
         return next_state_pred, reward_pred
 
 
-# DQN Network (same as original)
+# DQN Network
 class DQN(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(DQN, self).__init__()
 
         self.fc1 = nn.Linear(state_dim, hidden_dim)
@@ -119,8 +138,8 @@ class DQN(nn.Module):
         return q_values
 
 
-# World Model DQN Agent
-class WorldModelDQNAgent:
+# Enhanced World Model DQN Agent with Trajectory Planning
+class TrajectoryPlanningAgent:
     def __init__(
             self,
             state_dim,
@@ -135,8 +154,11 @@ class WorldModelDQNAgent:
             target_update_freq=10,
             model_lr=1e-3,
             model_update_freq=4,
-            use_model_ratio=0.5,  # 50% of training uses model-generated data
-            rollout_steps=1
+            use_model_ratio=0.7,
+            rollout_steps=5,
+            planning_horizon=5,
+            num_planning_samples=10,
+            use_planning=True
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -151,8 +173,11 @@ class WorldModelDQNAgent:
         self.steps_done = 0
 
         self.rollout_steps = rollout_steps
+        self.planning_horizon = planning_horizon
+        self.num_planning_samples = num_planning_samples
+        self.use_planning = use_planning
 
-        # Initialize Q-networks (same as DQN)
+        # Initialize Q-networks
         self.q_network = DQN(state_dim, action_dim).to(device)
         self.target_q_network = copy.deepcopy(self.q_network)
         self.q_optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
@@ -167,89 +192,80 @@ class WorldModelDQNAgent:
         # Metrics tracking
         self.model_losses = []
         self.q_losses = []
+        self.planning_stats = []
 
     def select_action(self, state, training=True):
-        """Select action using epsilon-greedy policy (same as DQN)"""
+        """Select action using epsilon-greedy policy with optional planning."""
         if training and random.random() < self.epsilon:
             return random.randrange(self.action_dim)
         else:
-            with torch.no_grad():
-                state = torch.FloatTensor(state).unsqueeze(0).to(device)
-                q_values = self.q_network(state)
-                return q_values.argmax(dim=1).item()
+            if self.use_planning and len(self.replay_buffer) > self.batch_size:
+                return self._plan_action(state)
+            else:
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    q_values = self.q_network(state_tensor)
+                    return q_values.argmax(dim=1).item()
+
+    def _plan_action(self, state):
+        """Model-based planning: simulate trajectories and choose best action."""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+
+            best_action = 0
+            best_value = float('-inf')
+
+            for action in range(self.action_dim):
+                trajectory_value = 0.0
+                current_state = state_tensor
+
+                for step in range(self.planning_horizon):
+                    if step == 0:
+                        current_action = action
+                    else:
+                        q_values = self.q_network(current_state)
+                        current_action = q_values.argmax(dim=1).item()
+
+                    action_tensor = torch.LongTensor([current_action]).unsqueeze(1).to(device)
+                    next_state_pred, reward_pred = self.transition_model(current_state, action_tensor)
+
+                    trajectory_value += (self.gamma ** step) * reward_pred.item()
+                    current_state = next_state_pred
+
+                terminal_q = self.q_network(current_state).max().item()
+                trajectory_value += (self.gamma ** self.planning_horizon) * terminal_q
+
+                if trajectory_value > best_value:
+                    best_value = trajectory_value
+                    best_action = action
+
+            return best_action
 
     def train_world_model(self):
         """Train the world model to predict next state and reward"""
         if len(self.replay_buffer) < self.batch_size:
             return None
 
-        # Sample batch from real experiences
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        # Predict next state and reward
         next_state_pred, reward_pred = self.transition_model(states, actions)
 
-        # Compute losses
         state_loss = F.mse_loss(next_state_pred, next_states)
         reward_loss = F.mse_loss(reward_pred, rewards)
         total_model_loss = state_loss + reward_loss
 
-        # Update world model
         self.model_optimizer.zero_grad()
         total_model_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.transition_model.parameters(), max_norm=1.0)
         self.model_optimizer.step()
 
         return total_model_loss.item()
-
-    # def generate_model_data(self, num_samples):
-    #     """Generate synthetic experiences using the world model"""
-    #     if len(self.replay_buffer) < num_samples:
-    #         return [], [], [], [], []
-    #
-    #     # Sample random states from replay buffer
-    #     experiences = random.sample(self.replay_buffer.buffer, k=num_samples)
-    #     states = [e.state for e in experiences]
-    #
-    #     model_states = []
-    #     model_actions = []
-    #     model_rewards = []
-    #     model_next_states = []
-    #     model_dones = []
-    #
-    #     with torch.no_grad():
-    #         for state in states:
-    #             # Random action for exploration in model
-    #             # action = random.randrange(self.action_dim)
-    #
-    #             # 不要完全随机，用epsilon-greedy
-    #             if random.random() < 0.3:  # 30%随机探索
-    #                 action = random.randrange(self.action_dim)
-    #             else:  # 70%根据当前策略选择
-    #                 with torch.no_grad():
-    #                     state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-    #                     q_values = self.q_network(state_tensor)
-    #                     action = q_values.argmax(dim=1).item()
-    #
-    #             # Use world model to predict next state and reward
-    #             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-    #             action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
-    #
-    #             next_state_pred, reward_pred = self.transition_model(state_tensor, action_tensor)
-    #
-    #             model_states.append(state)
-    #             model_actions.append(action)
-    #             model_rewards.append(reward_pred.item())
-    #             model_next_states.append(next_state_pred.squeeze().cpu().numpy())
-    #             model_dones.append(False)  # Assume no termination for simplicity
-    #
-    #     return model_states, model_actions, model_rewards, model_next_states, model_dones
 
     def generate_model_data(self, num_samples):
         """Generate synthetic experiences using the world model with multi-step rollout"""
         if len(self.replay_buffer) < num_samples:
             return [], [], [], [], []
 
-        # Sample random states from replay buffer
         experiences = random.sample(self.replay_buffer.buffer, k=num_samples)
         states = [e.state for e in experiences]
 
@@ -263,29 +279,24 @@ class WorldModelDQNAgent:
             for initial_state in states:
                 current_state = initial_state
 
-                # 进行多步展开
                 for step in range(self.rollout_steps):
-                    # 选择动作 (epsilon-greedy)
-                    if random.random() < 0.8:
+                    if random.random() < 0.3:
                         action = random.randrange(self.action_dim)
-                    else:  # 70%根据当前策略选择
+                    else:
                         state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(device)
                         q_values = self.q_network(state_tensor)
                         action = q_values.argmax(dim=1).item()
 
-                    # 使用world model预测下一状态和奖励
                     state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(device)
                     action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
                     next_state_pred, reward_pred = self.transition_model(state_tensor, action_tensor)
 
-                    # 存储这一步的转换
                     model_states.append(current_state.copy())
                     model_actions.append(action)
                     model_rewards.append(reward_pred.item())
                     model_next_states.append(next_state_pred.squeeze().cpu().numpy())
-                    model_dones.append(False)  # 假设不终止
+                    model_dones.append(False)
 
-                    # 更新当前状态为预测的下一状态，用于下一步预测
                     current_state = next_state_pred.squeeze().cpu().numpy()
 
         return model_states, model_actions, model_rewards, model_next_states, model_dones
@@ -296,7 +307,6 @@ class WorldModelDQNAgent:
             return None
 
         if use_model_data and random.random() < self.use_model_ratio:
-            # Use model-generated data
             states, actions, rewards, next_states, dones = self.generate_model_data(self.batch_size)
 
             if len(states) == 0:
@@ -308,47 +318,39 @@ class WorldModelDQNAgent:
             next_states = torch.FloatTensor(next_states).to(device)
             dones = torch.FloatTensor([int(d) for d in dones]).unsqueeze(1).to(device)
         else:
-            # Use real data from replay buffer
             states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        # Compute current Q values
         q_values = self.q_network(states).gather(1, actions)
 
-        # Compute target Q values
         with torch.no_grad():
             next_q_values = self.target_q_network(next_states).max(1, keepdim=True)[0]
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
-        # Compute loss
         q_loss = F.mse_loss(q_values, target_q_values)
 
-        # Optimize Q-network
         self.q_optimizer.zero_grad()
         q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
         self.q_optimizer.step()
 
         return q_loss.item()
 
     def train(self):
         """Combined training of world model and Q-network"""
-        # Train world model
         model_loss = None
         if self.steps_done % self.model_update_freq == 0:
             model_loss = self.train_world_model()
             if model_loss is not None:
                 self.model_losses.append(model_loss)
 
-        # Train Q-network (mix of real and model data)
         q_loss = self.train_q_network(use_model_data=True)
         if q_loss is not None:
             self.q_losses.append(q_loss)
 
-        # Update target network periodically
         self.steps_done += 1
         if self.steps_done % self.target_update_freq == 0:
             self.target_q_network.load_state_dict(self.q_network.state_dict())
 
-        # Decay epsilon
         self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
 
         return {"q_loss": q_loss, "model_loss": model_loss}
@@ -361,7 +363,6 @@ class WorldModelDQNAgent:
         torch.save(self.target_q_network.state_dict(), os.path.join(folder_path, "target_q_network.pth"))
         torch.save(self.transition_model.state_dict(), os.path.join(folder_path, "transition_model.pth"))
 
-        # Save training parameters
         params = {
             "epsilon": self.epsilon,
             "steps_done": self.steps_done,
@@ -375,7 +376,6 @@ class WorldModelDQNAgent:
         self.target_q_network.load_state_dict(torch.load(os.path.join(folder_path, "target_q_network.pth")))
         self.transition_model.load_state_dict(torch.load(os.path.join(folder_path, "transition_model.pth")))
 
-        # Load training parameters
         params = torch.load(os.path.join(folder_path, "params.pth"))
         self.epsilon = params["epsilon"]
         self.steps_done = params["steps_done"]
@@ -383,14 +383,13 @@ class WorldModelDQNAgent:
         self.q_losses = params.get("q_losses", [])
 
 
-# Environment wrapper (same as original)
+# Environment wrapper
 class UAVEnvWrapper:
     def __init__(self, env):
         self.env = env
         self.action_dim = 9
         self.num_users = env.num_users
         self.state_dim = 2 + 2 * self.num_users + self.num_users
-        self.current_render_dir = None
 
     def reset(self):
         obs, info = self.env.reset()
@@ -421,30 +420,16 @@ class UAVEnvWrapper:
         done = terminated or truncated
         return next_state, reward, done, info
 
-    def render(self):
-        if self.current_render_dir is not None:
-            original_dir = self.env.visualization_dir
-            self.env.visualization_dir = self.current_render_dir
-            self.env.render()
-            self.env.visualization_dir = original_dir
-        else:
-            self.env.render()
 
-    def set_render_dir(self, directory):
-        self.current_render_dir = directory
-        if directory is not None and not os.path.exists(directory):
-            os.makedirs(directory)
-
-
-# Training function for World Model DQN with data collection cutoff
-def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, render_every=20, save_every=50,
-                          data_collection_cutoff_episode=None):
+# Training function (without plotting)
+def train_trajectory_planner(env_wrapper, agent, num_episodes=200, max_steps=100, save_every=50,
+                              data_collection_cutoff_episode=None, project_name='trajectory_planning'):
     """
-    Train World Model DQN with optional data collection cutoff.
+    Train Trajectory Planning Agent with optional data collection cutoff.
+    No visualization - only saves metrics to CSV and models to disk.
 
     Args:
-        data_collection_cutoff_episode: Episode number after which to stop adding new data to buffer.
-                                      If None, data collection continues throughout training.
+        project_name: Name of the project, all results will be saved in this folder
     """
     rewards_history = []
     avg_rewards_history = []
@@ -452,15 +437,19 @@ def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, r
     q_losses = []
     epsilons = []
 
-    # Create directories
-    render_dir = os.path.join(os.getcwd(), 'world_model_renders')
-    os.makedirs(render_dir, exist_ok=True)
-    model_dir = os.path.join(os.getcwd(), 'world_model_models')
+    # Create directories with project name
+    project_dir = os.path.join(os.getcwd(), project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    model_dir = os.path.join(project_dir, 'models')
     os.makedirs(model_dir, exist_ok=True)
+
+    # Create metrics log file
+    metrics_file = os.path.join(project_dir, 'training_metrics.csv')
+    with open(metrics_file, 'w') as f:
+        f.write('episode,reward,avg_reward,epsilon,q_loss,model_loss,buffer_size,elapsed_time\n')
 
     start_time = time.time()
 
-    # Track buffer size for monitoring
     buffer_sizes = []
     data_collection_active = True
 
@@ -479,27 +468,14 @@ def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, r
                 print(f"Buffer size frozen at: {len(agent.replay_buffer)} experiences")
                 data_collection_active = False
 
-        # Set up render directory
-        if episode % render_every == 0:
-            episode_render_dir = os.path.join(render_dir, f'episode_{episode}')
-            os.makedirs(episode_render_dir, exist_ok=True)
-            env_wrapper.set_render_dir(episode_render_dir)
-        else:
-            env_wrapper.set_render_dir(None)
-
         # Episode loop
         for step in range(1, max_steps + 1):
-            # Select action
             action = agent.select_action(state)
-
-            # Take step in environment (always for getting current episode reward)
             next_state, reward, done, _ = env_wrapper.step(action)
 
-            # Store in replay buffer ONLY if data collection is active
             if data_collection_active:
                 agent.replay_buffer.add(state, action, reward, next_state, done)
 
-            # Train agent (both world model and Q-network) - this continues regardless
             losses = agent.train()
 
             if losses["q_loss"] is not None:
@@ -507,11 +483,6 @@ def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, r
             if losses["model_loss"] is not None:
                 episode_losses["model_loss"].append(losses["model_loss"])
 
-            # Render if needed
-            if episode % render_every == 0:
-                env_wrapper.render()
-
-            # Update state and reward
             state = next_state
             episode_reward += reward
 
@@ -524,7 +495,6 @@ def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, r
         avg_rewards_history.append(avg_reward)
         buffer_sizes.append(len(agent.replay_buffer))
 
-        # Record losses
         if episode_losses["q_loss"]:
             q_losses.append(np.mean(episode_losses["q_loss"]))
         else:
@@ -537,153 +507,53 @@ def train_world_model_dqn(env_wrapper, agent, num_episodes=200, max_steps=100, r
 
         epsilons.append(agent.epsilon)
 
-        # Print progress with data collection status
+        # Write metrics to file
+        elapsed_time = time.time() - start_time
+        with open(metrics_file, 'a') as f:
+            f.write(f'{episode},{episode_reward:.6f},{avg_reward:.6f},{agent.epsilon:.6f},'
+                    f'{q_losses[-1]:.6f},{model_losses[-1]:.6f},{len(agent.replay_buffer)},{elapsed_time:.2f}\n')
+
+        # Print progress
         if episode % 1 == 0:
-            elapsed_time = time.time() - start_time
             data_status = "ACTIVE" if data_collection_active else "STOPPED"
+            planning_status = "ENABLED" if agent.use_planning else "DISABLED"
             print(f"Episode {episode}/{num_episodes} - Reward: {episode_reward:.2f}, "
                   f"Avg Reward: {avg_reward:.2f}, Epsilon: {agent.epsilon:.2f}, "
                   f"Q Loss: {q_losses[-1]:.4f}, Model Loss: {model_losses[-1]:.4f}, "
                   f"Buffer: {len(agent.replay_buffer)}, Data: {data_status}, "
-                  f"Time: {elapsed_time:.2f}s")
+                  f"Planning: {planning_status}, Time: {elapsed_time:.2f}s")
 
-        # Save model and plot progress
+        # Save model
         if episode % save_every == 0:
             agent.save(os.path.join(model_dir, f'episode_{episode}'))
-
-            # Plot progress with model loss and buffer size
-            plt.figure(figsize=(20, 15))
-
-            plt.subplot(3, 3, 1)
-            plt.plot(rewards_history)
-            plt.title('Episode Rewards')
-            plt.xlabel('Episode')
-            plt.ylabel('Reward')
-
-            plt.subplot(3, 3, 2)
-            plt.plot(avg_rewards_history)
-            plt.title('Average Rewards (20 episodes)')
-            plt.xlabel('Episode')
-            plt.ylabel('Average Reward')
-
-            plt.subplot(3, 3, 3)
-            plt.plot(q_losses, label='Q Loss')
-            plt.plot(model_losses, label='Model Loss')
-            plt.title('Losses per Episode')
-            plt.xlabel('Episode')
-            plt.ylabel('Loss')
-            plt.legend()
-
-            plt.subplot(3, 3, 4)
-            plt.plot(epsilons)
-            plt.title('Exploration Rate (Epsilon)')
-            plt.xlabel('Episode')
-            plt.ylabel('Epsilon')
-
-            plt.subplot(3, 3, 5)
-            plt.plot(model_losses)
-            plt.title('World Model Loss')
-            plt.xlabel('Episode')
-            plt.ylabel('Model Loss')
-
-            plt.subplot(3, 3, 6)
-            plt.plot(buffer_sizes)
-            plt.title('Replay Buffer Size')
-            plt.xlabel('Episode')
-            plt.ylabel('Buffer Size')
-            if data_collection_cutoff_episode is not None:
-                plt.axvline(x=data_collection_cutoff_episode, color='r', linestyle='--',
-                            label=f'Data Cutoff: {data_collection_cutoff_episode}')
-                plt.legend()
-
-            plt.subplot(3, 3, 7)
-            # Compare with a hypothetical DQN baseline (for illustration)
-            plt.plot(avg_rewards_history, label='World Model DQN')
-            plt.title('Performance Comparison')
-            plt.xlabel('Episode')
-            plt.ylabel('Average Reward')
-            plt.legend()
-
-            plt.subplot(3, 3, 8)
-            # Show data collection phases
-            if data_collection_cutoff_episode is not None:
-                phase1 = avg_rewards_history[:min(data_collection_cutoff_episode, len(avg_rewards_history))]
-                phase2 = avg_rewards_history[data_collection_cutoff_episode:] if data_collection_cutoff_episode < len(
-                    avg_rewards_history) else []
-
-                plt.plot(range(1, len(phase1) + 1), phase1, 'b-', label='Data Collection Phase')
-                if len(phase2) > 0:
-                    plt.plot(range(data_collection_cutoff_episode + 1, len(avg_rewards_history) + 1),
-                             phase2, 'r-', label='Model-Only Training Phase')
-                plt.axvline(x=data_collection_cutoff_episode, color='k', linestyle='--', alpha=0.7)
-                plt.title('Training Phases')
-                plt.xlabel('Episode')
-                plt.ylabel('Average Reward')
-                plt.legend()
-            else:
-                plt.plot(avg_rewards_history)
-                plt.title('Continuous Data Collection')
-                plt.xlabel('Episode')
-                plt.ylabel('Average Reward')
-
-            plt.subplot(3, 3, 9)
-            # Loss comparison between phases
-            if data_collection_cutoff_episode is not None:
-                phase1_losses = q_losses[:min(data_collection_cutoff_episode, len(q_losses))]
-                phase2_losses = q_losses[data_collection_cutoff_episode:] if data_collection_cutoff_episode < len(
-                    q_losses) else []
-
-                plt.plot(range(1, len(phase1_losses) + 1), phase1_losses, 'b-', label='Data Collection Phase')
-                if len(phase2_losses) > 0:
-                    plt.plot(range(data_collection_cutoff_episode + 1, len(q_losses) + 1),
-                             phase2_losses, 'r-', label='Model-Only Training Phase')
-                plt.axvline(x=data_collection_cutoff_episode, color='k', linestyle='--', alpha=0.7)
-                plt.title('Q-Loss by Training Phase')
-                plt.xlabel('Episode')
-                plt.ylabel('Q Loss')
-                plt.legend()
-            else:
-                plt.plot(q_losses)
-                plt.title('Q-Loss (Continuous)')
-                plt.xlabel('Episode')
-                plt.ylabel('Q Loss')
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(model_dir, f'progress_{episode}.png'))
-            plt.close()
+            print(f"Checkpoint saved at episode {episode}")
 
     # Save final model
     agent.save(os.path.join(model_dir, 'final'))
+    print(f"Final model saved")
 
     return rewards_history, avg_rewards_history, q_losses, model_losses, epsilons, buffer_sizes
 
 
-# Evaluation function (same as DQN)
-def evaluate_world_model_dqn(env_wrapper, agent, num_episodes=5, render=True):
+# Evaluation function (without plotting)
+def evaluate_trajectory_planner(env_wrapper, agent, num_episodes=5, project_name='trajectory_planning'):
+    """Evaluate agent without visualization."""
     rewards = []
     steps = []
 
-    eval_dir = os.path.join(os.getcwd(), 'world_model_eval')
-    if render and not os.path.exists(eval_dir):
-        os.makedirs(eval_dir)
+    project_dir = os.path.join(os.getcwd(), project_name)
+    eval_dir = os.path.join(project_dir, 'evaluation')
+    os.makedirs(eval_dir, exist_ok=True)
 
     for episode in range(1, num_episodes + 1):
         state = env_wrapper.reset()
         episode_reward = 0
         step_count = 0
 
-        if render:
-            episode_render_dir = os.path.join(eval_dir, f'eval_episode_{episode}')
-            os.makedirs(episode_render_dir, exist_ok=True)
-            env_wrapper.set_render_dir(episode_render_dir)
-
         done = False
         while not done and step_count < 100:
             action = agent.select_action(state, training=False)
             next_state, reward, done, _ = env_wrapper.step(action)
-
-            if render:
-                env_wrapper.render()
 
             state = next_state
             episode_reward += reward
@@ -691,30 +561,26 @@ def evaluate_world_model_dqn(env_wrapper, agent, num_episodes=5, render=True):
 
         rewards.append(episode_reward)
         steps.append(step_count)
+
         print(f"Evaluation Episode {episode}/{num_episodes} - Reward: {episode_reward:.2f}, Steps: {step_count}")
 
     avg_reward = np.mean(rewards)
     avg_steps = np.mean(steps)
     print(f"Evaluation complete - Average Reward: {avg_reward:.2f}, Average Steps: {avg_steps:.2f}")
 
-    # Plot evaluation results
-    plt.figure(figsize=(10, 5))
-    plt.bar(range(1, num_episodes + 1), rewards)
-    plt.axhline(y=avg_reward, color='r', linestyle='--', label=f'Avg: {avg_reward:.2f}')
-    plt.xlabel('Episode')
-    plt.ylabel('Reward')
-    plt.title('World Model DQN Evaluation Results')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(eval_dir, 'evaluation_results.png'))
-    plt.close()
+    # Save evaluation metrics to file
+    eval_metrics_file = os.path.join(eval_dir, 'evaluation_metrics.csv')
+    with open(eval_metrics_file, 'w') as f:
+        f.write('episode,reward,steps\n')
+        for i, (r, s) in enumerate(zip(rewards, steps), 1):
+            f.write(f'{i},{r:.6f},{s}\n')
 
     return rewards, steps
 
 
 # Main function
 def main():
-    # Environment parameters (same as DQN)
+    # Environment parameters
     grid_size = 64
     num_users = 10
     max_steps = 100
@@ -725,18 +591,11 @@ def main():
     fixed_seed = 42
 
     print("=" * 70)
-    print("World Model DQN for UAV OFDMA Data Rate Optimization")
-    print("WITH DATA COLLECTION CUTOFF FEATURE")
-    print("=" * 70)
-    print("Key Features:")
-    print("- One-step transition model (avoids error accumulation)")
-    print("- Mixed training: real + model-generated data")
-    print("- Lightweight MLP architecture")
-    print("- Deterministic environment setup")
-    print("- NEW: Stop data collection after specified episode")
+    print("Trajectory Planning Agent for UAV OFDMA Optimization")
+    print("Training Mode: No Visualization (Faster)")
     print("=" * 70)
 
-    # Create environment (same setup as DQN)
+    # Create environment
     env = WeatherAwareUAVEnv(
         grid_size=grid_size,
         num_users=num_users,
@@ -753,7 +612,7 @@ def main():
         uav_initial_position=(grid_size // 2, grid_size // 2)
     )
 
-    # Same environment fixes as DQN version
+    # Fix environment for reproducibility
     _, _ = env.reset(seed=fixed_seed)
     fixed_user_positions = env.user_positions.copy()
     fixed_weather_center = env.weather_center.copy()
@@ -802,11 +661,11 @@ def main():
     # Create environment wrapper
     env_wrapper = UAVEnvWrapper(env)
 
-    # Create World Model DQN agent
+    # Create agent
     state_dim = env_wrapper.state_dim
     action_dim = env_wrapper.action_dim
 
-    agent = WorldModelDQNAgent(
+    agent = TrajectoryPlanningAgent(
         state_dim=state_dim,
         action_dim=action_dim,
         lr=1e-3,
@@ -817,66 +676,45 @@ def main():
         epsilon_min=0.1,
         epsilon_decay=0.995,
         target_update_freq=10,
-        model_lr=1e-3,  # Learning rate for world model
-        model_update_freq=4,  # Update world model every 4 steps
-        use_model_ratio=1.0,  # 80% model data, 20% real data
-        rollout_steps = 1
+        model_lr=1e-3,
+        model_update_freq=4,
+        use_model_ratio=0.7,
+        rollout_steps=5,
+        planning_horizon=5,
+        num_planning_samples=10,
+        use_planning=False
     )
-    test_only = False
-    checkpoint_path = ''
-    if test_only:
-        # Load trained model
-        print(f"Loading checkpoint from: {checkpoint_path}")
-        agent.load(checkpoint_path)
-
-        # Run world model test
-        print("\n" + "=" * 50)
-        print("TESTING WORLD MODEL")
-        print("=" * 50)
-        test_results = test_world_model(agent, env_wrapper, num_steps=100)
-
-        # Run evaluation
-        print("\n" + "=" * 50)
-        print("EVALUATING AGENT PERFORMANCE")
-        print("=" * 50)
-
-
-        return
-
-
 
     # Training parameters
-    num_episodes = 10000
-    render_every = 10000
+    num_episodes = 1000
     save_every = 100
+    data_collection_cutoff_episode = 4000
 
-    # NEW PARAMETER: Set when to stop collecting new data
-    # Set to None to disable cutoff, or specify episode number
-    data_collection_cutoff_episode = 4000  # Stop collecting new data after episode 5000
+    # Project name for organizing results
+    project_name = 'main_training_run'
 
+    print(f"\nProject Name: {project_name}")
     print(f"Training for {num_episodes} episodes")
-    print(f"World model update frequency: every {agent.model_update_freq} steps")
+    print(f"Rollout steps: {agent.rollout_steps}")
+    print(f"Planning horizon: {agent.planning_horizon}")
+    print(f"Model-based planning: {'ENABLED' if agent.use_planning else 'DISABLED'}")
     print(f"Model/Real data ratio: {agent.use_model_ratio:.1%}/{1 - agent.use_model_ratio:.1%}")
 
     if data_collection_cutoff_episode is not None:
         print(f"Data collection will stop after episode: {data_collection_cutoff_episode}")
-        print(
-            f"Episodes {data_collection_cutoff_episode + 1}-{num_episodes} will train purely on existing buffer + model data")
-    else:
-        print("Data collection will continue throughout training")
 
     # Train agent
-    print("\nTraining World Model DQN agent...")
+    print("\nTraining Trajectory Planning Agent...")
     start_time = time.time()
 
-    rewards_history, avg_rewards_history, q_losses, model_losses, epsilons, buffer_sizes = train_world_model_dqn(
+    rewards_history, avg_rewards_history, q_losses, model_losses, epsilons, buffer_sizes = train_trajectory_planner(
         env_wrapper=env_wrapper,
         agent=agent,
         num_episodes=num_episodes,
         max_steps=max_steps,
-        render_every=render_every,
         save_every=save_every,
-        data_collection_cutoff_episode=data_collection_cutoff_episode  # NEW PARAMETER
+        data_collection_cutoff_episode=data_collection_cutoff_episode,
+        project_name=project_name
     )
 
     end_time = time.time()
@@ -886,20 +724,22 @@ def main():
     print(f"Training completed in {int(hours)}h {int(minutes)}m {seconds:.2f}s")
 
     # Evaluate agent
-    print("\nEvaluating World Model DQN agent...")
-    rewards, steps = evaluate_world_model_dqn(
+    print("\nEvaluating Trajectory Planning Agent...")
+    rewards, steps = evaluate_trajectory_planner(
         env_wrapper=env_wrapper,
         agent=agent,
         num_episodes=5,
-        render=True
+        project_name=project_name
     )
 
+    project_dir = os.path.join(os.getcwd(), project_name)
     print("\nTraining and evaluation completed!")
-    print(f"Models saved in: {os.path.join(os.getcwd(), 'world_model_models')}")
-    print(f"Renders saved in: {os.path.join(os.getcwd(), 'world_model_renders')}")
-    print(f"Evaluation results saved in: {os.path.join(os.getcwd(), 'world_model_eval')}")
+    print(f"All results saved in: {project_dir}")
+    print(f"  - Models: {os.path.join(project_dir, 'models')}")
+    print(f"  - Training metrics: {os.path.join(project_dir, 'training_metrics.csv')}")
+    print(f"  - Evaluation metrics: {os.path.join(project_dir, 'evaluation/evaluation_metrics.csv')}")
 
-    # Print final comparison metrics
+    # Print final results
     print("\n" + "=" * 50)
     print("FINAL RESULTS SUMMARY")
     print("=" * 50)
@@ -912,9 +752,8 @@ def main():
     if data_collection_cutoff_episode is not None:
         print(f"\nData Collection Analysis:")
         print(f"Data collection stopped at episode: {data_collection_cutoff_episode}")
-        print(f"Buffer size at cutoff: {buffer_sizes[data_collection_cutoff_episode - 1]} experiences")
+        print(f"Buffer size at cutoff: {buffer_sizes[min(data_collection_cutoff_episode - 1, len(buffer_sizes) - 1)]} experiences")
 
-        # Compare performance before and after cutoff
         if len(avg_rewards_history) > data_collection_cutoff_episode:
             pre_cutoff_avg = np.mean(
                 avg_rewards_history[max(0, data_collection_cutoff_episode - 100):data_collection_cutoff_episode])
@@ -923,171 +762,6 @@ def main():
             print(f"Average reward after cutoff: {post_cutoff_avg:.2f}")
             print(f"Performance change: {post_cutoff_avg - pre_cutoff_avg:+.2f}")
 
-
-def test_world_model(agent, env_wrapper, num_steps=100, seed=42):
-    """测试训练好的world model，比较真实和预测的reward/state误差"""
-    # 设置随机种子 - 使用与原代码相同的方式
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-
-    # 设置评估模式
-    agent.q_network.eval()
-    agent.transition_model.eval()
-
-    # 存储结果
-    real_rewards = []
-    pred_rewards = []
-    reward_errors = []
-    state_errors = []
-
-    # 重置环境
-    state = env_wrapper.reset()
-    real_state = torch.FloatTensor(state).unsqueeze(0).to(device)
-    pred_state = real_state.clone()
-
-    print(f"\nStarting World Model test for {num_steps} steps...")
-    print("-" * 50)
-
-    for step in range(num_steps):
-        # 使用训练好的agent选择动作（小epsilon保证一定探索）
-        epsilon = 0.8
-        if np.random.random() < epsilon:
-            action = np.random.randint(env_wrapper.action_dim)
-        else:
-            with torch.no_grad():
-                q_values = agent.q_network(real_state)
-                action = q_values.argmax().item()
-
-        # 转换动作为tensor格式（与transition_model期望的格式一致）
-        action_tensor = torch.LongTensor([action]).unsqueeze(1).to(device)
-
-        # 真实环境步进
-        next_state, real_reward, done, _ = env_wrapper.step(action)
-        real_next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)
-
-        # World model预测
-        with torch.no_grad():
-            pred_next_state, pred_reward_tensor = agent.transition_model(pred_state, action_tensor)
-            pred_reward = pred_reward_tensor.item()
-
-        # 计算误差
-        reward_error = abs(real_reward - pred_reward)
-        state_error = torch.norm(real_next_state - pred_next_state).item()
-
-        # 存储数据
-        real_rewards.append(real_reward)
-        pred_rewards.append(pred_reward)
-        reward_errors.append(reward_error)
-        state_errors.append(state_error)
-
-        if step % 1 == 0:
-            print(f"Step {step:3d}: Real Reward={real_reward:8.4f}, Pred Reward={pred_reward:8.4f}, "
-                  f"Reward Error={reward_error:8.4f}, State Error={state_error:8.4f}")
-
-        # 更新状态
-        real_state = real_next_state
-        pred_state = pred_next_state  # 使用预测状态进行下一步预测（测试累积误差）
-
-        if done:
-            print(f"Episode ended at step {step + 1}")
-            break
-
-    # 恢复训练模式
-    agent.q_network.train()
-    agent.transition_model.train()
-
-    # 计算统计信息
-    avg_reward_error = np.mean(reward_errors)
-    avg_state_error = np.mean(state_errors)
-    max_reward_error = np.max(reward_errors)
-    max_state_error = np.max(state_errors)
-    std_reward_error = np.std(reward_errors)
-    std_state_error = np.std(state_errors)
-
-    print("-" * 50)
-    print("World Model Test Results:")
-    print(f"Average reward error: {avg_reward_error:.6f} ± {std_reward_error:.6f}")
-    print(f"Maximum reward error: {max_reward_error:.6f}")
-    print(f"sum reward error :{np.sum(real_rewards)}")
-    print(f"Average state error:  {avg_state_error:.6f} ± {std_state_error:.6f}")
-    print(f"Maximum state error:  {max_state_error:.6f}")
-    print(f"Test steps: {len(real_rewards)}")
-
-    # 绘制结果
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('World Model Test Results - UAV OFDMA Environment', fontsize=16)
-
-    # Reward error curve
-    axes[0, 0].plot(reward_errors, 'r-', alpha=0.7, linewidth=1)
-    axes[0, 0].axhline(y=avg_reward_error, color='r', linestyle='--', alpha=0.8,
-                       label=f'Average error: {avg_reward_error:.4f}')
-    axes[0, 0].set_title('Reward Prediction Error')
-    axes[0, 0].set_xlabel('Steps')
-    axes[0, 0].set_ylabel('Absolute Error')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # State error curve
-    axes[0, 1].plot(state_errors, 'b-', alpha=0.7, linewidth=1)
-    axes[0, 1].axhline(y=avg_state_error, color='b', linestyle='--', alpha=0.8,
-                       label=f'Average error: {avg_state_error:.4f}')
-    axes[0, 1].set_title('State Prediction Error')
-    axes[0, 1].set_xlabel('Steps')
-    axes[0, 1].set_ylabel('L2 Norm Error')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Real vs predicted rewards
-    steps = range(len(real_rewards))
-    axes[1, 0].plot(steps, real_rewards, 'g-', label='Real Reward', alpha=0.8, linewidth=2)
-    axes[1, 0].plot(steps, pred_rewards, 'r--', label='Predicted Reward', alpha=0.8, linewidth=2)
-    axes[1, 0].set_title('Real vs Predicted Rewards')
-    axes[1, 0].set_xlabel('Steps')
-    axes[1, 0].set_ylabel('Reward Value')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Cumulative errors
-    cumulative_reward_error = np.cumsum(reward_errors)
-    cumulative_state_error = np.cumsum(state_errors)
-    axes[1, 1].plot(steps, cumulative_reward_error, 'r-', label='Cumulative Reward Error', alpha=0.8, linewidth=2)
-    ax2 = axes[1, 1].twinx()
-    ax2.plot(steps, cumulative_state_error, 'b-', label='Cumulative State Error', alpha=0.8, linewidth=2)
-    axes[1, 1].set_title('Cumulative Error Trends')
-    axes[1, 1].set_xlabel('Steps')
-    axes[1, 1].set_ylabel('Cumulative Reward Error', color='r')
-    ax2.set_ylabel('Cumulative State Error', color='b')
-    axes[1, 1].tick_params(axis='y', labelcolor='r')
-    ax2.tick_params(axis='y', labelcolor='b')
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    # 保存图表
-    os.makedirs('world_model_test', exist_ok=True)
-    plt.savefig('world_model_test/world_model_test_results.png', dpi=300, bbox_inches='tight')
-    print(f"\nTest results chart saved to: world_model_test/world_model_test_results.png")
-
-    # 也显示图表（如果在交互环境中）
-    plt.show()
-
-    return {
-        'real_rewards': real_rewards,
-        'pred_rewards': pred_rewards,
-        'reward_errors': reward_errors,
-        'state_errors': state_errors,
-        'avg_reward_error': avg_reward_error,
-        'avg_state_error': avg_state_error,
-        'max_reward_error': max_reward_error,
-        'max_state_error': max_state_error,
-        'std_reward_error': std_reward_error,
-        'std_state_error': std_state_error
-    }
 
 if __name__ == "__main__":
     main()
